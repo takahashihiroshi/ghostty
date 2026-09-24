@@ -14,21 +14,49 @@ extension Ghostty {
         /// If multiple items map to the same shortcut, the most recent one wins.
         private var menuItemsByShortcut: [MenuShortcutKey: Weak<NSMenuItem>] = [:]
 
+        /// Configured shortcuts already include key-remap and must not be remapped again.
+        private var configuredMenuItems: Set<ObjectIdentifier> = []
+
+        /// Keep native shortcuts across reloads so swaps always start from the original
+        /// modifiers. Weak keys allow dynamically removed menu items to be released.
+        private let nativeModifiers = NSMapTable<NSMenuItem, NSNumber>.weakToStrongObjects()
+
         /// Reset our shortcut index since we're about to rebuild all menu bindings.
         func reset() {
             menuItemsByShortcut.removeAll(keepingCapacity: true)
+            configuredMenuItems.removeAll(keepingCapacity: true)
         }
 
         /// Syncs a single menu shortcut for the given action. The action string is the same
         /// action string used for the Ghostty configuration.
         func syncMenuShortcut(_ config: Ghostty.Config, action: String?, menuItem: NSMenuItem?) {
             guard let menu = menuItem else { return }
+            configuredMenuItems.insert(ObjectIdentifier(menu))
 
             if !updateMenuShortcut(config, action: action, menuItem: menu) {
                 menu.keyEquivalent = ""
                 menu.keyEquivalentModifierMask = []
                 menu.allowsAutomaticKeyEquivalentLocalization = true
                 menu.allowsAutomaticKeyEquivalentMirroring = true
+            }
+        }
+
+        /// Remap AppKit shortcuts after syncing Ghostty actions. These native menu
+        /// items, such as Hide, do not appear in the configured binding set.
+        func syncNativeMenuShortcuts(_ config: Ghostty.Config, menu: NSMenu?) {
+            guard let menu else { return }
+            for item in menu.items {
+                if !configuredMenuItems.contains(ObjectIdentifier(item)), !item.keyEquivalent.isEmpty {
+                    let original: NSEvent.ModifierFlags
+                    if let saved = nativeModifiers.object(forKey: item) {
+                        original = .init(rawValue: saved.uintValue)
+                    } else {
+                        original = item.keyEquivalentModifierMask
+                        nativeModifiers.setObject(NSNumber(value: original.rawValue), forKey: item)
+                    }
+                    item.keyEquivalentModifierMask = config.remapMenuModifiers(original)
+                }
+                syncNativeMenuShortcuts(config, menu: item.submenu)
             }
         }
 

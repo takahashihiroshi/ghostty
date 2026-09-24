@@ -2649,14 +2649,8 @@ pub fn preeditCallback(self: *Surface, preedit_: ?[]const u8) !void {
 /// then Ghosty will act as though the binding does not exist.
 pub fn keyEventIsBinding(
     self: *Surface,
-    event_orig: input.KeyEvent,
+    event: input.KeyEvent,
 ) ?input.Binding.Flags {
-    // Apply key remappings for consistency with keyCallback
-    var event = event_orig;
-    if (self.config.key_remaps.isRemapped(event_orig.mods)) {
-        event.mods = self.config.key_remaps.apply(event_orig.mods);
-    }
-
     switch (event.action) {
         .release => return null,
         .press, .repeat => {},
@@ -2736,7 +2730,9 @@ pub fn keyCallback(
     // Handle keybindings first. We need to handle this on all events
     // (press, repeat, release) because a press may perform a binding but
     // a release should not encode if we consumed the press.
+    // Configured triggers already include key-remap, matching GUI accelerators.
     if (try self.maybeHandleBinding(
+        event_orig,
         event,
         if (insp_ev) |*ev| ev else null,
     )) |v| return v;
@@ -2889,6 +2885,7 @@ pub fn keyCallback(
 fn maybeHandleBinding(
     self: *Surface,
     event: input.KeyEvent,
+    encoded_event: input.KeyEvent,
     insp_ev: ?*inspectorpkg.KeyEvent,
 ) !?InputEffect {
     switch (event.action) {
@@ -2972,7 +2969,7 @@ fn maybeHandleBinding(
             // Store this event so that we can drain and encode on invalid.
             // We don't need to cap this because it is naturally capped by
             // the config validation.
-            if (try self.encodeKey(event, insp_ev)) |req| {
+            if (try self.encodeKey(encoded_event, insp_ev)) |req| {
                 self.keyboard.sequence_queued.append(self.alloc, req) catch |err| {
                     req.deinit();
                     return err;

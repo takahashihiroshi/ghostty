@@ -121,6 +121,16 @@ fn config_trigger_(
     return trigger.cval();
 }
 
+/// Apply finalized key-remap settings to modifiers, for toolkit shortcuts
+/// which aren't backed by a configured Ghostty action.
+export fn ghostty_config_remap_mods(self: *const Config, mods_raw: c_int) c_int {
+    const mods: inputpkg.Mods = @bitCast(@as(
+        inputpkg.Mods.Backing,
+        @truncate(@as(c_uint, @bitCast(mods_raw))),
+    ));
+    return @intCast(self.@"key-remap".apply(mods).int());
+}
+
 export fn ghostty_config_diagnostics_count(self: *Config) u32 {
     return @intCast(self._diagnostics.items().len);
 }
@@ -277,4 +287,22 @@ test "ghostty_config_trigger: default keybind" {
         try testing.expectEqual(.physical, trigger.tag);
         try testing.expectEqual(.unidentified, trigger.key.physical);
     }
+}
+
+test "ghostty_config_remap_mods" {
+    const testing = std.testing;
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    const alloc = cfg._arena.?.allocator();
+    const command: inputpkg.Mods = .{ .super = true };
+    const control: inputpkg.Mods = .{ .ctrl = true };
+    try testing.expectEqual(@as(c_int, command.int()), ghostty_config_remap_mods(&cfg, command.int()));
+    try cfg.@"key-remap".parse(alloc, "super=ctrl");
+    try cfg.@"key-remap".parse(alloc, "ctrl=super");
+    try cfg.finalize();
+    try testing.expectEqual(@as(c_int, control.int()), ghostty_config_remap_mods(&cfg, command.int()));
+    try testing.expectEqual(@as(c_int, command.int()), ghostty_config_remap_mods(&cfg, control.int()));
+    const shifted: inputpkg.Mods = .{ .super = true, .shift = true };
+    const expected: inputpkg.Mods = .{ .ctrl = true, .shift = true };
+    try testing.expectEqual(@as(c_int, expected.int()), ghostty_config_remap_mods(&cfg, shifted.int()));
 }

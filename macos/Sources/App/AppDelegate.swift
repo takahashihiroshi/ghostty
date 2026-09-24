@@ -1221,6 +1221,8 @@ extension AppDelegate {
         //
         // syncMenuShortcut(config, action: "toggle_fullscreen", menuItem: self.menuToggleFullScreen)
 
+        menuShortcutManager.syncNativeMenuShortcuts(config, menu: NSApp.mainMenu)
+
         // Dock menu
         reloadDockMenu()
     }

@@ -1974,14 +1974,9 @@ keybind: Keybinds = .{},
 /// * Generic modifiers (e.g. `ctrl`) match both left and right physical keys.
 ///   Use sided names (e.g. `left_ctrl`) to remap only one side.
 ///
-/// There are other edge case scenarios that may not behave as expected
-/// but are working as intended the way this feature is designed:
-///
-/// * On macOS, bindings in the main menu will trigger before any remapping
-///   is done. This is because macOS itself handles menu activation and
-///   this happens before Ghostty receives the key event. To workaround
-///   this, you should unbind the menu items and rebind them using your
-///   desired modifier.
+/// Configured keybindings (including menu shortcuts and key tables) have
+/// their modifiers remapped as well. Keybindings are matched against the
+/// original event; terminal input uses the remapped modifiers.
 ///
 /// This configuration can be repeated to specify multiple remaps.
 @"key-remap": KeyRemapSet = .empty,
@@ -3941,6 +3936,9 @@ term: []const u8 = "xterm-ghostty",
 /// This is set by the CLI parser for deinit.
 _arena: ?ArenaAllocator = null,
 
+/// Avoid applying modifier swaps again on repeated finalization.
+_keybinds_remapped: bool = false,
+
 /// List of diagnostics that were generated during the loading of
 /// the configuration.
 _diagnostics: cli.DiagnosticList = .{},
@@ -4878,6 +4876,13 @@ pub fn finalize(self: *Config) !void {
 
     // Finalize key remapping set for efficient lookups
     self.@"key-remap".finalize();
+    if (!self._keybinds_remapped) {
+        try self.keybind.set.applyRemaps(alloc, &self.@"key-remap");
+        for (self.keybind.tables.values()) |*set| {
+            try set.applyRemaps(alloc, &self.@"key-remap");
+        }
+        self._keybinds_remapped = true;
+    }
 }
 
 /// Callback for src/cli/args.zig to allow us to handle special cases
@@ -5146,6 +5151,8 @@ pub fn clone(
             @field(self, field.name),
         );
     }
+
+    result._keybinds_remapped = self._keybinds_remapped;
 
     // Copy our diagnostics
     result._diagnostics = try self._diagnostics.clone(alloc_arena);
@@ -11296,4 +11303,43 @@ test "compatibility: window new-window" {
             cfg.@"macos-dock-drop-behavior",
         );
     }
+}
+
+test "finalize: applyRemaps to bindings and tables once" {
+    const testing = std.testing;
+    var cfg = try Config.default(testing.allocator);
+    defer cfg.deinit();
+    const alloc = cfg._arena.?.allocator();
+    try cfg.keybind.parseCLI(alloc, "clear");
+    try cfg.keybind.parseCLI(alloc, "super+h=toggle_visibility");
+    try cfg.keybind.parseCLI(alloc, "example/ctrl+a=new_window");
+    try cfg.@"key-remap".parse(alloc, "super=ctrl");
+    try cfg.@"key-remap".parse(alloc, "ctrl=super");
+    try cfg.finalize();
+    try cfg.finalize();
+
+    const trigger = try inputpkg.Binding.Trigger.parse("ctrl+h");
+    try testing.expect(trigger.equal(cfg.keybind.set.getTrigger(.toggle_visibility).?));
+    // Physical Cmd+H reaches terminal encoding instead of hiding the app.
+    try testing.expect(cfg.keybind.set.getEvent(.{
+        .action = .press,
+        .key = .key_h,
+        .mods = .{ .super = true },
+        .unshifted_codepoint = 'h',
+    }) == null);
+    try testing.expect(cfg.@"key-remap".apply(.{ .super = true }).ctrl);
+    try testing.expect(cfg.keybind.set.getEvent(.{
+        .action = .press,
+        .key = .key_h,
+        .mods = .{ .ctrl = true },
+        .unshifted_codepoint = 'h',
+    }) != null);
+    try testing.expect(cfg.keybind.tables.get("example").?.get(
+        try inputpkg.Binding.Trigger.parse("super+a"),
+    ) != null);
+
+    var cloned = try cfg.clone(testing.allocator);
+    defer cloned.deinit();
+    try cloned.finalize();
+    try testing.expect(trigger.equal(cloned.keybind.set.getTrigger(.toggle_visibility).?));
 }

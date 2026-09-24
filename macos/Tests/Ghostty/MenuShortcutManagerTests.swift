@@ -62,4 +62,79 @@ struct MenuShortcutManagerTests {
         #expect(goToLeftItem.keyEquivalent == "h")
         #expect(goToLeftItem.keyEquivalentModifierMask == .command)
     }
+
+    @MainActor @Test func nativeShortcutsRemapAndRestoreOnReload() throws {
+        let config = try TemporaryConfig("""
+        key-remap = super=ctrl
+        key-remap = ctrl=super
+        """)
+        let root = NSMenu()
+        let parent = NSMenuItem(title: "App", action: nil, keyEquivalent: "")
+        root.addItem(parent)
+        let menu = NSMenu()
+        parent.submenu = menu
+        let hide = NSMenuItem(title: "Hide", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        hide.keyEquivalentModifierMask = .command
+        menu.addItem(hide)
+        let other = NSMenuItem(title: "Other", action: nil, keyEquivalent: "x")
+        other.keyEquivalentModifierMask = [.command, .shift]
+        menu.addItem(other)
+        let configured = NSMenuItem(title: "New Tab", action: nil, keyEquivalent: "")
+        menu.addItem(configured)
+        let manager = Ghostty.MenuShortcutManager()
+
+        for _ in 0..<2 {
+            manager.reset()
+            manager.syncMenuShortcut(config, action: "new_tab", menuItem: configured)
+            manager.syncNativeMenuShortcuts(config, menu: root)
+            #expect(hide.keyEquivalentModifierMask == .control)
+            #expect(other.keyEquivalentModifierMask == [.control, .shift])
+            // The configured binding was already remapped by Config.finalize.
+            #expect(configured.keyEquivalentModifierMask == .control)
+        }
+
+        try config.reload("")
+        manager.reset()
+        manager.syncMenuShortcut(config, action: "new_tab", menuItem: configured)
+        manager.syncNativeMenuShortcuts(config, menu: root)
+        #expect(hide.keyEquivalentModifierMask == .command)
+        #expect(other.keyEquivalentModifierMask == [.command, .shift])
+        #expect(configured.keyEquivalentModifierMask == .command)
+    }
+
+    @MainActor @Test func remappedNativeShortcutDoesNotConsumeCommandH() throws {
+        let config = try TemporaryConfig("""
+        key-remap = super=ctrl
+        key-remap = ctrl=super
+        """)
+        let target = ShortcutTarget()
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+        let hide = NSMenuItem(title: "Hide", action: #selector(ShortcutTarget.invoke(_:)), keyEquivalent: "h")
+        hide.target = target
+        hide.keyEquivalentModifierMask = .command
+        menu.addItem(hide)
+        let manager = Ghostty.MenuShortcutManager()
+        manager.syncNativeMenuShortcuts(config, menu: menu)
+
+        func event(_ modifiers: NSEvent.ModifierFlags) throws -> NSEvent {
+            try #require(NSEvent.keyEvent(
+                with: .keyDown, location: .zero, modifierFlags: modifiers,
+                timestamp: 1, windowNumber: 0, context: nil, characters: "h",
+                charactersIgnoringModifiers: "h", isARepeat: false, keyCode: 4))
+        }
+        #expect(!menu.performKeyEquivalent(with: try event(.command)))
+        #expect(target.count == 0)
+        #expect(menu.performKeyEquivalent(with: try event(.control)))
+        #expect(target.count == 1)
+    }
+
+    @MainActor private class ShortcutTarget: NSObject {
+        var count = 0
+
+        @objc func invoke(_ sender: NSMenuItem) {
+            count += 1
+        }
+    }
+
 }

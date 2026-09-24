@@ -2816,6 +2816,104 @@ pub const Set = struct {
         _ = self.reverse.swapRemove(action);
     }
 
+    /// Remap triggers in array order. Later entries win collisions, just as
+    /// repeated puts do; colliding leaders merge their sequences. Overwriting
+    /// a trigger does not change its array position, so this is deliberately
+    /// not a reconstruction of configuration parsing order.
+    /// The remap set must be finalized before calling this function.
+    pub fn applyRemaps(
+        self: *Set,
+        alloc: Allocator,
+        remaps: *const key_mods.RemapSet,
+    ) Allocator.Error!void {
+        if (remaps.map.count() == 0) return;
+
+        var result: Set = .{};
+        errdefer result.deinit(alloc);
+        try self.copyRemapped(&result, alloc, remaps);
+
+        // Build accelerators from surviving ordinary leaves only. Doing this
+        // after resolving collisions also handles performable/chain overrides.
+        for (result.bindings.keys(), result.bindings.values()) |trigger, value| {
+            switch (value) {
+                .leaf => |leaf| if (!leaf.flags.performable) {
+                    try result.reverse.put(alloc, leaf.action, trigger);
+                },
+                .leader, .leaf_chained => {},
+            }
+        }
+
+        // Preserve the selected accelerator when multiple triggers share an
+        // action, provided that the selected binding survived the remap.
+        for (self.reverse.keys(), self.reverse.values()) |action, original| {
+            var trigger = original;
+            trigger.mods = remaps.apply(trigger.mods).binding();
+            const value = result.bindings.get(trigger) orelse continue;
+            switch (value) {
+                .leaf => |leaf| if (!leaf.flags.performable and
+                    leaf.action.equal(action))
+                {
+                    try result.reverse.put(alloc, action, trigger);
+                },
+                .leader, .leaf_chained => {},
+            }
+        }
+
+        self.deinit(alloc);
+        self.* = result;
+    }
+
+    fn copyRemapped(
+        self: *const Set,
+        dest: *Set,
+        alloc: Allocator,
+        remaps: *const key_mods.RemapSet,
+    ) Allocator.Error!void {
+        for (self.bindings.keys(), self.bindings.values()) |original, value| {
+            var trigger = original;
+            // Binding lookup ignores physical sides, including a sided remap
+            // destination. Normalize it just as getEvent does.
+            trigger.mods = remaps.apply(trigger.mods).binding();
+            switch (value) {
+                .leader => |source| {
+                    const child = child: {
+                        if (dest.bindings.get(trigger)) |old| {
+                            if (old == .leader) break :child old.leader;
+                            dest.remove(alloc, trigger);
+                        }
+                        const next = try alloc.create(Set);
+                        errdefer alloc.destroy(next);
+                        next.* = .{};
+                        try dest.bindings.put(alloc, trigger, .{ .leader = next });
+                        break :child next;
+                    };
+                    try source.copyRemapped(child, alloc, remaps);
+                },
+                inline .leaf, .leaf_chained => |leaf| {
+                    const generic = leaf.generic();
+                    const actions = generic.actionsSlice();
+                    // Suppress intermediate reverse entries. The final map is
+                    // rebuilt above, excluding nested sequences and chains.
+                    var flags = generic.flags;
+                    flags.performable = true;
+                    try dest.putFlags(alloc, trigger, actions[0], flags);
+                    for (actions[1..]) |action| {
+                        dest.appendChain(alloc, action) catch |err| switch (err) {
+                            error.NoChainParent => unreachable,
+                            error.OutOfMemory => return error.OutOfMemory,
+                        };
+                    }
+                    switch (dest.bindings.getPtr(trigger).?.*) {
+                        inline .leaf, .leaf_chained => |*new| new.flags = generic.flags,
+                        .leader => unreachable,
+                    }
+                },
+            }
+        }
+        // Insertion invalidates chain-parent pointers when sets move.
+        dest.chain_parent = null;
+    }
+
     /// Deep clone the set.
     pub fn clone(self: *const Set, alloc: Allocator) !Set {
         var result: Set = .{
@@ -4918,4 +5016,150 @@ test "set: formatEntries leaf_chained with text action" {
         \\
     ;
     try testing.expectEqualStrings(expected, output.written());
+}
+
+test "set: applyRemaps modifiers and reverse mappings" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: Set = .{};
+    defer set.deinit(alloc);
+    var remaps: key_mods.RemapSet = .empty;
+    defer remaps.deinit(alloc);
+    try remaps.parse(alloc, "super=ctrl");
+    try remaps.parse(alloc, "ctrl=super");
+    remaps.finalize();
+
+    try set.parseAndPut(alloc, "super+h=new_window");
+    try set.parseAndPut(alloc, "ctrl+a=new_tab");
+    try set.parseAndPut(alloc, "alt+b=close_surface");
+    try set.parseAndPut(alloc, "super+shift+c=toggle_fullscreen");
+    try set.applyRemaps(alloc, &remaps);
+
+    const expected = .{
+        .{ "ctrl+h", Action.new_window },
+        .{ "super+a", Action.new_tab },
+        .{ "alt+b", Action.close_surface },
+        .{ "ctrl+shift+c", Action.toggle_fullscreen },
+    };
+    inline for (expected) |pair| {
+        const trigger = try Trigger.parse(pair[0]);
+        try testing.expectEqual(pair[1], set.get(trigger).?.value_ptr.leaf.action);
+        try testing.expect(trigger.equal(set.getTrigger(pair[1]).?));
+    }
+    try testing.expect(set.get(try Trigger.parse("super+h")) == null);
+    try testing.expect(set.get(try Trigger.parse("ctrl+a")) == null);
+}
+
+test "set: applyRemaps sided and empty" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: Set = .{};
+    defer set.deinit(alloc);
+    var remaps: key_mods.RemapSet = .empty;
+    defer remaps.deinit(alloc);
+    const left: Trigger = .{ .key = .{ .unicode = 'a' }, .mods = .{ .ctrl = true } };
+    var right = left;
+    right.key = .{ .unicode = 'b' };
+    right.mods.sides.ctrl = .right;
+    try set.put(alloc, left, .new_window);
+    try set.put(alloc, right, .new_tab);
+    try set.applyRemaps(alloc, &remaps);
+    try testing.expect(set.get(left) != null);
+    try testing.expect(set.get(right) != null);
+
+    try remaps.parse(alloc, "left_ctrl=right_super");
+    remaps.finalize();
+    try set.applyRemaps(alloc, &remaps);
+    try testing.expect(set.get(left) == null);
+    right.mods = right.mods.binding();
+    try testing.expectEqual(Action.new_tab, set.get(right).?.value_ptr.leaf.action);
+    try testing.expectEqual(Action.new_window, set.getEvent(.{
+        .unshifted_codepoint = 'a',
+        .mods = .{ .super = true, .sides = .{ .super = .right } },
+    }).?.value_ptr.leaf.action);
+}
+
+test "set: applyRemaps collisions chains and sequences" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: Set = .{};
+    defer set.deinit(alloc);
+    var remaps: key_mods.RemapSet = .empty;
+    defer remaps.deinit(alloc);
+    try remaps.parse(alloc, "ctrl=super");
+    remaps.finalize();
+
+    try set.parseAndPut(alloc, "alt+a=new_window");
+    try set.parseAndPut(alloc, "ctrl+a=new_window");
+    try set.parseAndPut(alloc, "super+a=new_tab");
+    // Updating an existing entry keeps its array position.
+    try set.parseAndPut(alloc, "ctrl+a=close_surface");
+    try set.parseAndPut(alloc, "ctrl+b=new_window");
+    try set.parseAndPut(alloc, "performable:super+b=close_surface");
+    try set.parseAndPut(alloc, "ctrl+c=new_window");
+    try set.parseAndPut(alloc, "unconsumed:super+c=new_tab");
+    try set.parseAndPut(alloc, "chain=toggle_fullscreen");
+    try set.parseAndPut(alloc, "ctrl+d>ctrl+x=new_window");
+    try set.parseAndPut(alloc, "super+d>alt+y=new_tab");
+    try set.applyRemaps(alloc, &remaps);
+
+    try testing.expectEqual(Action.new_tab, set.get(try Trigger.parse("super+a")).?.value_ptr.leaf.action);
+    try testing.expect(set.getTrigger(.close_surface) == null);
+    try testing.expect((try Trigger.parse("alt+a")).equal(set.getTrigger(.new_window).?));
+    const chained = set.get(try Trigger.parse("super+c")).?.value_ptr.leaf_chained;
+    try testing.expect(!chained.flags.consumed);
+    try testing.expectEqualSlices(Action, &.{ .new_tab, .toggle_fullscreen }, chained.actions.items);
+    try testing.expect(set.getTrigger(.toggle_fullscreen) == null);
+    const leader = set.get(try Trigger.parse("super+d")).?.value_ptr.leader;
+    try testing.expectEqual(Action.new_window, leader.get(try Trigger.parse("super+x")).?.value_ptr.leaf.action);
+    try testing.expectEqual(Action.new_tab, leader.get(try Trigger.parse("alt+y")).?.value_ptr.leaf.action);
+    try testing.expectEqual(@as(usize, 0), leader.reverse.count());
+}
+
+test "set: applyRemaps preserves preferred accelerator" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var set: Set = .{};
+    defer set.deinit(alloc);
+    var remaps: key_mods.RemapSet = .empty;
+    defer remaps.deinit(alloc);
+    try remaps.parse(alloc, "ctrl=super");
+    remaps.finalize();
+    try set.parseAndPut(alloc, "ctrl+a=new_window");
+    try set.parseAndPut(alloc, "ctrl+b=new_window");
+    try set.parseAndPut(alloc, "ctrl+a=new_window");
+    try set.applyRemaps(alloc, &remaps);
+    try testing.expect((try Trigger.parse("super+a")).equal(set.getTrigger(.new_window).?));
+}
+
+test "set: applyRemaps allocation failures and leader collisions" {
+    const testing = std.testing;
+    const Test = struct {
+        fn run(alloc: Allocator) !void {
+            var set: Set = .{};
+            defer set.deinit(testing.allocator);
+            var remaps: key_mods.RemapSet = .empty;
+            defer remaps.deinit(testing.allocator);
+            try remaps.parse(testing.allocator, "super=ctrl");
+            remaps.finalize();
+            // Construct the source outside the failing allocator so failures
+            // exercise the remap's ownership and cleanup specifically.
+            try set.parseAndPut(testing.allocator, "super+a>super+b=new_window");
+            try set.parseAndPut(testing.allocator, "ctrl+a=new_tab");
+            try set.parseAndPut(testing.allocator, "super+c=new_window");
+            try set.parseAndPut(testing.allocator, "ctrl+c>super+d=close_surface");
+            try set.parseAndPut(testing.allocator, "global:super+e=text:hello");
+            try set.parseAndPut(testing.allocator, "chain=text:world");
+            // Both allocators use the testing allocator as backing storage.
+            try set.applyRemaps(alloc, &remaps);
+            try testing.expectEqual(Action.new_tab, set.get(try Trigger.parse("ctrl+a")).?.value_ptr.leaf.action);
+            const leader = set.get(try Trigger.parse("ctrl+c")).?.value_ptr.leader;
+            try testing.expect(leader.get(try Trigger.parse("ctrl+d")) != null);
+            const chain = set.get(try Trigger.parse("ctrl+e")).?.value_ptr.leaf_chained;
+            try testing.expect(chain.flags.global);
+            try testing.expectEqualStrings("hello", chain.actions.items[0].text);
+            try testing.expectEqualStrings("world", chain.actions.items[1].text);
+        }
+    };
+    try testing.checkAllAllocationFailures(testing.allocator, Test.run, .{});
 }

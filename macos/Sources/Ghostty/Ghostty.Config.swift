@@ -121,6 +121,14 @@ extension Ghostty {
             return ghostty_config_trigger(config, action, UInt(action.lengthOfBytes(using: .utf8)))
         }
 
+        /// Apply key-remap to a native menu shortcut without changing other AppKit flags.
+        func remapMenuModifiers(_ modifiers: NSEvent.ModifierFlags) -> NSEvent.ModifierFlags {
+            guard let config else { return modifiers }
+            let keys: NSEvent.ModifierFlags = [.shift, .control, .option, .command]
+            let remapped = ghostty_config_remap_mods(config, Ghostty.ghosttyMods(modifiers.intersection(keys)))
+            return modifiers.subtracting(keys).union(Ghostty.eventModifierFlags(mods: remapped))
+        }
+
         // MARK: - Configuration Values
 
         /// For all of the configuration values below, see the associated Ghostty documentation for
